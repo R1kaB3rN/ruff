@@ -123,6 +123,10 @@ impl ScopedSymbolId {
         let symbols = public_symbols_map(db, file);
         symbols.public(self)
     }
+
+    pub(crate) fn to_file_symbol(self, file: FileScopeId) -> FileSymbolId {
+        FileSymbolId::new(file, self)
+    }
 }
 
 /// Returns a mapping from [`FileScopeId`] to globally unique [`ScopeId`].
