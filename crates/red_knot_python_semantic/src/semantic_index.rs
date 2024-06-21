@@ -11,6 +11,7 @@ use ruff_python_ast as ast;
 use crate::node_key::NodeKey;
 use crate::semantic_index::ast_ids::{AstId, AstIds, ScopedClassId, ScopedFunctionId};
 use crate::semantic_index::builder::SemanticIndexBuilder;
+use crate::semantic_index::definition::DefinitionNodeKey;
 use crate::semantic_index::symbol::{
     FileScopeId, PublicSymbolId, Scope, ScopeId, ScopedSymbolId, SymbolTable,
 };
@@ -92,8 +93,11 @@ pub struct SemanticIndex {
     /// Map from scope to the node that introduces the scope.
     nodes_by_scope: IndexVec<FileScopeId, NodeWithScopeId>,
 
-    /// Map from nodes that introduce a scope to the scope they define.
-    scopes_by_node: FxHashMap<NodeWithScopeKey, FileScopeId>,
+    /// Map from definitions to their scope. The scope depends on whether the definition introduces a scope or not.
+    ///
+    /// * introduce a scope: The scope that the definition introduces
+    /// * other definitions: The enclosing scope
+    scopes_by_definition: FxHashMap<DefinitionNodeKey, FileScopeId>,
 }
 
 impl SemanticIndex {
@@ -163,11 +167,8 @@ impl SemanticIndex {
         self.nodes_by_scope[scope_id]
     }
 
-    pub(crate) fn definition_scope(
-        &self,
-        node_with_scope: impl Into<NodeWithScopeKey>,
-    ) -> FileScopeId {
-        self.scopes_by_node[&node_with_scope.into()]
+    pub(crate) fn definition_scope(&self, definition: impl Into<DefinitionNodeKey>) -> FileScopeId {
+        self.scopes_by_definition[&definition.into()]
     }
 }
 
@@ -272,33 +273,6 @@ pub(crate) enum NodeWithScopeId {
     ClassTypeParams(AstId<ScopedClassId>),
     Function(AstId<ScopedFunctionId>),
     FunctionTypeParams(AstId<ScopedFunctionId>),
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub(crate) struct NodeWithScopeKey(NodeKey);
-
-impl From<&ast::StmtClassDef> for NodeWithScopeKey {
-    fn from(node: &ast::StmtClassDef) -> Self {
-        Self(NodeKey::from_node(node))
-    }
-}
-
-impl From<&ast::StmtFunctionDef> for NodeWithScopeKey {
-    fn from(value: &ast::StmtFunctionDef) -> Self {
-        Self(NodeKey::from_node(value))
-    }
-}
-
-impl From<&ast::TypeParams> for NodeWithScopeKey {
-    fn from(value: &ast::TypeParams) -> Self {
-        Self(NodeKey::from_node(value))
-    }
-}
-
-impl From<&ast::ModModule> for NodeWithScopeKey {
-    fn from(value: &ast::ModModule) -> Self {
-        Self(NodeKey::from_node(value))
-    }
 }
 
 #[cfg(test)]

@@ -4,10 +4,11 @@ use ruff_db::parsed::ParsedModule;
 use ruff_db::vfs::VfsFile;
 use ruff_index::{newtype_index, IndexVec};
 use ruff_python_ast as ast;
-use ruff_python_ast::{AnyNodeRef, ExpressionRef};
+use ruff_python_ast::{Alias, ExpressionRef, StmtClassDef, StmtFunctionDef};
 
 use crate::ast_node_ref::AstNodeRef;
 use crate::node_key::NodeKey;
+use crate::semantic_index::definition::DefinitionNodeKey;
 use crate::semantic_index::semantic_index;
 use crate::semantic_index::symbol::{FileScopeId, ScopeId};
 use crate::Db;
@@ -32,26 +33,19 @@ pub(crate) struct AstIds {
     expressions: IndexVec<ScopedExpressionId, AstNodeRef<ast::Expr>>,
 
     /// Maps expressions to their expression id. Uses `NodeKey` because it avoids cloning [`Parsed`].
-    expressions_map: FxHashMap<NodeKey, ScopedExpressionId>,
+    expressions_map: FxHashMap<ExpressionNodeKey, ScopedExpressionId>,
 
-    statements: IndexVec<ScopedStatementId, AstNodeRef<ast::Stmt>>,
+    definitions: IndexVec<ScopedDefinitionNodeId, DefinitionNodeRef>,
 
-    statements_map: FxHashMap<NodeKey, ScopedStatementId>,
+    definitions_map: FxHashMap<DefinitionNodeKey, ScopedDefinitionNodeId>,
 }
 
 impl AstIds {
-    fn statement_id<'a, N>(&self, node: N) -> ScopedStatementId
-    where
-        N: Into<AnyNodeRef<'a>>,
-    {
-        self.statements_map[&NodeKey::from_node(node.into())]
-    }
-
     fn expression_id<'a, N>(&self, node: N) -> ScopedExpressionId
     where
         N: Into<ExpressionRef<'a>>,
     {
-        self.expressions_map[&NodeKey::from_node(node.into())]
+        self.expressions_map[&ExpressionNodeKey::from(node.into())]
     }
 }
 
@@ -60,7 +54,7 @@ impl std::fmt::Debug for AstIds {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AstIds")
             .field("expressions", &self.expressions)
-            .field("statements", &self.statements)
+            .field("statements", &self.definitions)
             .finish()
     }
 }
@@ -228,12 +222,12 @@ impl ScopedAstIdNode for ast::Expr {
 
 /// Uniquely identifies an [`ast::Stmt`] in a [`FileScopeId`].
 #[newtype_index]
-pub struct ScopedStatementId;
+pub struct ScopedDefinitionNodeId;
 
-macro_rules! impl_has_scoped_statement_id {
+macro_rules! impl_has_scoped_definition_id {
     ($ty: ty) => {
         impl HasScopedAstId for $ty {
-            type Id = ScopedStatementId;
+            type Id = ScopedDefinitionNodeId;
 
             fn scoped_ast_id(
                 &self,
@@ -243,25 +237,14 @@ macro_rules! impl_has_scoped_statement_id {
             ) -> Self::Id {
                 let scope = file_scope.to_scope_id(db, file);
                 let ast_ids = ast_ids(db, scope);
-                ast_ids.statement_id(self)
+                ast_ids.definitions_map[&self.into()]
             }
         }
     };
 }
 
-impl_has_scoped_statement_id!(ast::Stmt);
-
-impl ScopedAstIdNode for ast::Stmt {
-    fn lookup_in_scope(db: &dyn Db, file: VfsFile, file_scope: FileScopeId, id: Self::Id) -> &Self {
-        let scope = file_scope.to_scope_id(db, file);
-        let ast_ids = ast_ids(db, scope);
-
-        ast_ids.statements[id].node()
-    }
-}
-
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Hash)]
-pub struct ScopedFunctionId(pub(super) ScopedStatementId);
+pub struct ScopedFunctionId(ScopedDefinitionNodeId);
 
 impl HasScopedAstId for ast::StmtFunctionDef {
     type Id = ScopedFunctionId;
@@ -269,20 +252,25 @@ impl HasScopedAstId for ast::StmtFunctionDef {
     fn scoped_ast_id(&self, db: &dyn Db, file: VfsFile, file_scope: FileScopeId) -> Self::Id {
         let scope = file_scope.to_scope_id(db, file);
         let ast_ids = ast_ids(db, scope);
-        ScopedFunctionId(ast_ids.statement_id(self))
+        ScopedFunctionId(ast_ids.definitions_map[&self.into()])
     }
 }
 
 impl ScopedAstIdNode for ast::StmtFunctionDef {
-    fn lookup_in_scope(db: &dyn Db, file: VfsFile, scope: FileScopeId, id: Self::Id) -> &Self {
-        ast::Stmt::lookup_in_scope(db, file, scope, id.0)
-            .as_function_def_stmt()
-            .unwrap()
+    fn lookup_in_scope(db: &dyn Db, file: VfsFile, file_scope: FileScopeId, id: Self::Id) -> &Self {
+        let scope = file_scope.to_scope_id(db, file);
+        let ast_ids = ast_ids(db, scope);
+
+        if let DefinitionNodeRef::Function(function) = &ast_ids.definitions[id.0] {
+            function.node()
+        } else {
+            panic!("Expected function definition")
+        }
     }
 }
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Hash)]
-pub struct ScopedClassId(pub(super) ScopedStatementId);
+pub struct ScopedClassId(ScopedDefinitionNodeId);
 
 impl HasScopedAstId for ast::StmtClassDef {
     type Id = ScopedClassId;
@@ -290,37 +278,41 @@ impl HasScopedAstId for ast::StmtClassDef {
     fn scoped_ast_id(&self, db: &dyn Db, file: VfsFile, file_scope: FileScopeId) -> Self::Id {
         let scope = file_scope.to_scope_id(db, file);
         let ast_ids = ast_ids(db, scope);
-        ScopedClassId(ast_ids.statement_id(self))
+        ScopedClassId(ast_ids.definitions_map[&self.into()])
     }
 }
 
 impl ScopedAstIdNode for ast::StmtClassDef {
-    fn lookup_in_scope(db: &dyn Db, file: VfsFile, scope: FileScopeId, id: Self::Id) -> &Self {
-        let statement = ast::Stmt::lookup_in_scope(db, file, scope, id.0);
-        statement.as_class_def_stmt().unwrap()
+    fn lookup_in_scope(db: &dyn Db, file: VfsFile, file_scope: FileScopeId, id: Self::Id) -> &Self {
+        let scope = file_scope.to_scope_id(db, file);
+        let ast_ids = ast_ids(db, scope);
+
+        if let DefinitionNodeRef::Class(class) = &ast_ids.definitions[id.0] {
+            class.node()
+        } else {
+            panic!("Expected class definition")
+        }
     }
 }
 
-impl_has_scoped_statement_id!(ast::StmtAssign);
-impl_has_scoped_statement_id!(ast::StmtAnnAssign);
-impl_has_scoped_statement_id!(ast::StmtImport);
-impl_has_scoped_statement_id!(ast::StmtImportFrom);
+impl_has_scoped_definition_id!(ast::Alias);
 
 #[derive(Debug)]
 pub(super) struct AstIdsBuilder {
     expressions: IndexVec<ScopedExpressionId, AstNodeRef<ast::Expr>>,
-    expressions_map: FxHashMap<NodeKey, ScopedExpressionId>,
-    statements: IndexVec<ScopedStatementId, AstNodeRef<ast::Stmt>>,
-    statements_map: FxHashMap<NodeKey, ScopedStatementId>,
+    expressions_map: FxHashMap<ExpressionNodeKey, ScopedExpressionId>,
+    definitions: IndexVec<ScopedDefinitionNodeId, DefinitionNodeRef>,
+    definitions_map: FxHashMap<DefinitionNodeKey, ScopedDefinitionNodeId>,
 }
 
+#[allow(unsafe_code)]
 impl AstIdsBuilder {
     pub(super) fn new() -> Self {
         Self {
             expressions: IndexVec::default(),
             expressions_map: FxHashMap::default(),
-            statements: IndexVec::default(),
-            statements_map: FxHashMap::default(),
+            definitions: IndexVec::default(),
+            definitions_map: FxHashMap::default(),
         }
     }
 
@@ -329,18 +321,59 @@ impl AstIdsBuilder {
     /// ## Safety
     /// The function is marked as unsafe because it calls [`AstNodeRef::new`] which requires
     /// that `stmt` is a child of `parsed`.
-    #[allow(unsafe_code)]
-    pub(super) unsafe fn record_statement(
+    pub(super) unsafe fn record_function_definition(
         &mut self,
-        stmt: &ast::Stmt,
+        function_definition: &ast::StmtFunctionDef,
         parsed: &ParsedModule,
-    ) -> ScopedStatementId {
-        let statement_id = self.statements.push(AstNodeRef::new(parsed.clone(), stmt));
+    ) -> ScopedFunctionId {
+        let function_id = self
+            .definitions
+            .push(AstNodeRef::new(parsed.clone(), function_definition).into());
 
-        self.statements_map
-            .insert(NodeKey::from_node(stmt), statement_id);
+        self.definitions_map
+            .insert(DefinitionNodeKey::from(function_definition), function_id);
 
-        statement_id
+        ScopedFunctionId(function_id)
+    }
+
+    /// Adds `stmt` to the AST ids map and returns its id.
+    ///
+    /// ## Safety
+    /// The function is marked as unsafe because it calls [`AstNodeRef::new`] which requires
+    /// that `stmt` is a child of `parsed`.
+    pub(super) unsafe fn record_class_definition(
+        &mut self,
+        class_definition: &ast::StmtClassDef,
+        parsed: &ParsedModule,
+    ) -> ScopedClassId {
+        let function_id = self
+            .definitions
+            .push(AstNodeRef::new(parsed.clone(), class_definition).into());
+
+        self.definitions_map
+            .insert(DefinitionNodeKey::from(class_definition), function_id);
+
+        ScopedClassId(function_id)
+    }
+
+    /// Adds `stmt` to the AST ids map and returns its id.
+    ///
+    /// ## Safety
+    /// The function is marked as unsafe because it calls [`AstNodeRef::new`] which requires
+    /// that `stmt` is a child of `parsed`.
+    pub(super) unsafe fn record_alias(
+        &mut self,
+        alias: &ast::Alias,
+        parsed: &ParsedModule,
+    ) -> ScopedDefinitionNodeId {
+        let alias_id = self
+            .definitions
+            .push(AstNodeRef::new(parsed.clone(), alias).into());
+
+        self.definitions_map
+            .insert(DefinitionNodeKey::from(alias), alias_id);
+
+        alias_id
     }
 
     /// Adds `expr` to the AST ids map and returns its id.
@@ -356,8 +389,7 @@ impl AstIdsBuilder {
     ) -> ScopedExpressionId {
         let expression_id = self.expressions.push(AstNodeRef::new(parsed.clone(), expr));
 
-        self.expressions_map
-            .insert(NodeKey::from_node(expr), expression_id);
+        self.expressions_map.insert(expr.into(), expression_id);
 
         expression_id
     }
@@ -365,14 +397,54 @@ impl AstIdsBuilder {
     pub(super) fn finish(mut self) -> AstIds {
         self.expressions.shrink_to_fit();
         self.expressions_map.shrink_to_fit();
-        self.statements.shrink_to_fit();
-        self.statements_map.shrink_to_fit();
+        self.definitions.shrink_to_fit();
+        self.definitions_map.shrink_to_fit();
 
         AstIds {
             expressions: self.expressions,
             expressions_map: self.expressions_map,
-            statements: self.statements,
-            statements_map: self.statements_map,
+            definitions: self.definitions,
+            definitions_map: self.definitions_map,
         }
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+struct ExpressionNodeKey(NodeKey);
+
+impl From<ExpressionRef<'_>> for ExpressionNodeKey {
+    fn from(value: ExpressionRef<'_>) -> Self {
+        Self(NodeKey::from_node(value))
+    }
+}
+
+impl From<&ast::Expr> for ExpressionNodeKey {
+    fn from(value: &ast::Expr) -> Self {
+        Self(NodeKey::from_node(value))
+    }
+}
+
+#[derive(Debug)]
+enum DefinitionNodeRef {
+    Alias(()),
+    Function(AstNodeRef<ast::StmtFunctionDef>),
+    Class(AstNodeRef<ast::StmtClassDef>),
+}
+
+impl From<AstNodeRef<ast::StmtFunctionDef>> for DefinitionNodeRef {
+    fn from(value: AstNodeRef<StmtFunctionDef>) -> Self {
+        Self::Function(value)
+    }
+}
+
+impl From<AstNodeRef<ast::StmtClassDef>> for DefinitionNodeRef {
+    fn from(value: AstNodeRef<StmtClassDef>) -> Self {
+        Self::Class(value)
+    }
+}
+
+impl From<AstNodeRef<ast::Alias>> for DefinitionNodeRef {
+    fn from(_value: AstNodeRef<Alias>) -> Self {
+        Self::Alias(())
     }
 }

@@ -9,12 +9,14 @@ use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
 
 use crate::name::Name;
 use crate::node_key::NodeKey;
-use crate::semantic_index::ast_ids::{AstId, AstIdsBuilder, ScopedClassId, ScopedFunctionId};
-use crate::semantic_index::definition::{Definition, ImportDefinition, ImportFromDefinition};
+use crate::semantic_index::ast_ids::{
+    AstId, AstIdsBuilder, ScopedClassId, ScopedExpressionId, ScopedFunctionId,
+};
+use crate::semantic_index::definition::{Definition, DefinitionNodeKey};
 use crate::semantic_index::symbol::{
     FileScopeId, FileSymbolId, Scope, ScopeKind, ScopedSymbolId, SymbolFlags, SymbolTableBuilder,
 };
-use crate::semantic_index::{NodeWithScopeId, NodeWithScopeKey, SemanticIndex};
+use crate::semantic_index::{NodeWithScopeId, SemanticIndex};
 
 pub(super) struct SemanticIndexBuilder<'a> {
     // Builder state
@@ -29,7 +31,7 @@ pub(super) struct SemanticIndexBuilder<'a> {
     ast_ids: IndexVec<FileScopeId, AstIdsBuilder>,
     expression_scopes: FxHashMap<NodeKey, FileScopeId>,
     scope_nodes: IndexVec<FileScopeId, NodeWithScopeId>,
-    node_scopes: FxHashMap<NodeWithScopeKey, FileScopeId>,
+    scopes_by_definition: FxHashMap<DefinitionNodeKey, FileScopeId>,
 }
 
 impl<'a> SemanticIndexBuilder<'a> {
@@ -43,16 +45,12 @@ impl<'a> SemanticIndexBuilder<'a> {
             symbol_tables: IndexVec::new(),
             ast_ids: IndexVec::new(),
             expression_scopes: FxHashMap::default(),
-            node_scopes: FxHashMap::default(),
+            scopes_by_definition: FxHashMap::default(),
             scope_nodes: IndexVec::new(),
         };
 
         builder.push_scope_with_parent(
-            NodeWithScope::new(
-                parsed.syntax(),
-                NodeWithScopeId::Module,
-                Name::new_static("<module>"),
-            ),
+            NodeWithScope::new(NodeWithScopeId::Module, Name::new_static("<module>")),
             None,
             None,
             None,
@@ -86,7 +84,7 @@ impl<'a> SemanticIndexBuilder<'a> {
         parent: Option<FileScopeId>,
     ) {
         let children_start = self.scopes.next_index() + 1;
-        let node_key = node.key();
+        let node_key = node.definition_key();
         let node_id = node.id();
         let scope_kind = node.scope_kind();
 
@@ -107,7 +105,10 @@ impl<'a> SemanticIndexBuilder<'a> {
         debug_assert_eq!(ast_id_scope, scope_id);
         debug_assert_eq!(scope_id, scope_node_id);
         self.scope_stack.push(scope_id);
-        self.node_scopes.insert(node_key, scope_id);
+
+        if let Some(definition_key) = node_key {
+            self.scopes_by_definition.insert(definition_key, scope_id);
+        }
     }
 
     fn pop_scope(&mut self) -> FileScopeId {
@@ -145,7 +146,6 @@ impl<'a> SemanticIndexBuilder<'a> {
     fn add_or_update_symbol_with_definition(
         &mut self,
         name: Name,
-
         definition: Definition,
     ) -> ScopedSymbolId {
         let symbol_table = self.current_symbol_table();
@@ -169,7 +169,7 @@ impl<'a> SemanticIndexBuilder<'a> {
             };
 
             self.push_scope(
-                NodeWithScope::new(type_params, type_params_id, name),
+                NodeWithScope::new(type_params_id, name),
                 Some(defining_symbol),
                 Some(with_params.definition()),
             );
@@ -224,161 +224,13 @@ impl<'a> SemanticIndexBuilder<'a> {
             symbol_tables,
             scopes: self.scopes,
             nodes_by_scope: self.scope_nodes,
-            scopes_by_node: self.node_scopes,
+            scopes_by_definition: self.scopes_by_definition,
             ast_ids,
             scopes_by_expression: self.expression_scopes,
         }
     }
-}
 
-impl Visitor<'_> for SemanticIndexBuilder<'_> {
-    fn visit_stmt(&mut self, stmt: &ast::Stmt) {
-        let module = self.module;
-        #[allow(unsafe_code)]
-        let statement_id = unsafe {
-            // SAFETY: The builder only visits nodes that are part of `module`. This guarantees that
-            // the current statement must be a child of `module`.
-            self.current_ast_ids().record_statement(stmt, module)
-        };
-        match stmt {
-            ast::Stmt::FunctionDef(function_def) => {
-                for decorator in &function_def.decorator_list {
-                    self.visit_decorator(decorator);
-                }
-                let name = Name::new(&function_def.name.id);
-                let function_id = ScopedFunctionId(statement_id);
-                let definition = Definition::FunctionDef(function_id);
-                let scope = self.current_scope();
-                let symbol = FileSymbolId::new(
-                    scope,
-                    self.add_or_update_symbol_with_definition(name.clone(), definition),
-                );
-
-                self.with_type_params(
-                    name.clone(),
-                    &WithTypeParams::FunctionDef {
-                        node: function_def,
-                        id: AstId::new(scope, function_id),
-                    },
-                    symbol,
-                    |builder| {
-                        builder.visit_parameters(&function_def.parameters);
-                        for expr in &function_def.returns {
-                            builder.visit_annotation(expr);
-                        }
-
-                        builder.push_scope(
-                            NodeWithScope::new(
-                                function_def,
-                                NodeWithScopeId::Function(AstId::new(scope, function_id)),
-                                name,
-                            ),
-                            Some(symbol),
-                            Some(definition),
-                        );
-                        builder.visit_body(&function_def.body);
-                        builder.pop_scope()
-                    },
-                );
-            }
-            ast::Stmt::ClassDef(class) => {
-                for decorator in &class.decorator_list {
-                    self.visit_decorator(decorator);
-                }
-
-                let name = Name::new(&class.name.id);
-                let class_id = ScopedClassId(statement_id);
-                let definition = Definition::ClassDef(class_id);
-                let scope = self.current_scope();
-                let id = FileSymbolId::new(
-                    self.current_scope(),
-                    self.add_or_update_symbol_with_definition(name.clone(), definition),
-                );
-                self.with_type_params(
-                    name.clone(),
-                    &WithTypeParams::ClassDef {
-                        node: class,
-                        id: AstId::new(scope, class_id),
-                    },
-                    id,
-                    |builder| {
-                        if let Some(arguments) = &class.arguments {
-                            builder.visit_arguments(arguments);
-                        }
-
-                        builder.push_scope(
-                            NodeWithScope::new(
-                                class,
-                                NodeWithScopeId::Class(AstId::new(scope, class_id)),
-                                name,
-                            ),
-                            Some(id),
-                            Some(definition),
-                        );
-                        builder.visit_body(&class.body);
-
-                        builder.pop_scope()
-                    },
-                );
-            }
-            ast::Stmt::Import(ast::StmtImport { names, .. }) => {
-                for (i, alias) in names.iter().enumerate() {
-                    let symbol_name = if let Some(asname) = &alias.asname {
-                        asname.id.as_str()
-                    } else {
-                        alias.name.id.split('.').next().unwrap()
-                    };
-
-                    let def = Definition::Import(ImportDefinition {
-                        import_id: statement_id,
-                        alias: u32::try_from(i).unwrap(),
-                    });
-                    self.add_or_update_symbol_with_definition(Name::new(symbol_name), def);
-                }
-            }
-            ast::Stmt::ImportFrom(ast::StmtImportFrom {
-                module: _,
-                names,
-                level: _,
-                ..
-            }) => {
-                for (i, alias) in names.iter().enumerate() {
-                    let symbol_name = if let Some(asname) = &alias.asname {
-                        asname.id.as_str()
-                    } else {
-                        alias.name.id.as_str()
-                    };
-                    let def = Definition::ImportFrom(ImportFromDefinition {
-                        import_id: statement_id,
-                        name: u32::try_from(i).unwrap(),
-                    });
-                    self.add_or_update_symbol_with_definition(Name::new(symbol_name), def);
-                }
-            }
-            ast::Stmt::Assign(node) => {
-                debug_assert!(self.current_definition.is_none());
-                self.visit_expr(&node.value);
-                self.current_definition = Some(Definition::Assignment(statement_id));
-                for target in &node.targets {
-                    self.visit_expr(target);
-                }
-                self.current_definition = None;
-            }
-            _ => {
-                walk_stmt(self, stmt);
-            }
-        }
-    }
-
-    fn visit_expr(&mut self, expr: &'_ ast::Expr) {
-        let module = self.module;
-        #[allow(unsafe_code)]
-        let expression_id = unsafe {
-            // SAFETY: The builder only visits nodes that are part of `module`. This guarantees that
-            // the current expression must be a child of `module`.
-            self.current_ast_ids().record_expression(expr, module)
-        };
-
+    fn visit_expression_with_id(&mut self, expr: &ast::Expr, expression_id: ScopedExpressionId) {
         self.expression_scopes
             .insert(NodeKey::from_node(expr), self.current_scope());
 
@@ -403,6 +255,7 @@ impl Visitor<'_> for SemanticIndexBuilder<'_> {
             }
             ast::Expr::Named(node) => {
                 debug_assert!(self.current_definition.is_none());
+
                 self.current_definition = Some(Definition::NamedExpr(expression_id));
                 // TODO walrus in comprehensions is implicitly nonlocal
                 self.visit_expr(&node.target);
@@ -442,6 +295,188 @@ impl Visitor<'_> for SemanticIndexBuilder<'_> {
     }
 }
 
+impl Visitor<'_> for SemanticIndexBuilder<'_> {
+    fn visit_stmt(&mut self, stmt: &ast::Stmt) {
+        let module = self.module;
+
+        match stmt {
+            ast::Stmt::FunctionDef(function_def) => {
+                for decorator in &function_def.decorator_list {
+                    self.visit_decorator(decorator);
+                }
+                let name = Name::new(&function_def.name.id);
+                #[allow(unsafe_code)]
+                let function_id = unsafe {
+                    // SAFETY: The builder only visits nodes that are part of `module`. This guarantees that
+                    // the current statement must be a child of `module`.
+                    self.current_ast_ids()
+                        .record_function_definition(function_def, module)
+                };
+                let definition = Definition::FunctionDef(function_id);
+                let scope = self.current_scope();
+                let symbol = FileSymbolId::new(
+                    scope,
+                    self.add_or_update_symbol_with_definition(name.clone(), definition),
+                );
+
+                self.with_type_params(
+                    name.clone(),
+                    &WithTypeParams::FunctionDef {
+                        node: function_def,
+                        id: AstId::new(scope, function_id),
+                    },
+                    symbol,
+                    |builder| {
+                        builder.visit_parameters(&function_def.parameters);
+                        for expr in &function_def.returns {
+                            builder.visit_annotation(expr);
+                        }
+
+                        builder.push_scope(
+                            NodeWithScope::with_definition(
+                                NodeWithScopeId::Function(AstId::new(scope, function_id)),
+                                name,
+                                function_def,
+                            ),
+                            Some(symbol),
+                            Some(definition),
+                        );
+                        builder.visit_body(&function_def.body);
+                        builder.pop_scope()
+                    },
+                );
+            }
+            ast::Stmt::ClassDef(class) => {
+                for decorator in &class.decorator_list {
+                    self.visit_decorator(decorator);
+                }
+
+                let name = Name::new(&class.name.id);
+                #[allow(unsafe_code)]
+                let class_id = unsafe {
+                    // SAFETY: The builder only visits nodes that are part of `module`. This guarantees that
+                    // the current statement must be a child of `module`.
+                    self.current_ast_ids()
+                        .record_class_definition(class, module)
+                };
+                let definition = Definition::ClassDef(class_id);
+                let scope = self.current_scope();
+                let id = FileSymbolId::new(
+                    self.current_scope(),
+                    self.add_or_update_symbol_with_definition(name.clone(), definition),
+                );
+                self.with_type_params(
+                    name.clone(),
+                    &WithTypeParams::ClassDef {
+                        node: class,
+                        id: AstId::new(scope, class_id),
+                    },
+                    id,
+                    |builder| {
+                        if let Some(arguments) = &class.arguments {
+                            builder.visit_arguments(arguments);
+                        }
+
+                        builder.push_scope(
+                            NodeWithScope::with_definition(
+                                NodeWithScopeId::Class(AstId::new(scope, class_id)),
+                                name,
+                                class,
+                            ),
+                            Some(id),
+                            Some(definition),
+                        );
+                        builder.visit_body(&class.body);
+
+                        builder.pop_scope()
+                    },
+                );
+            }
+            ast::Stmt::Import(ast::StmtImport { names, .. }) => {
+                let scope_id = self.current_scope();
+                for alias in names {
+                    let symbol_name = if let Some(asname) = &alias.asname {
+                        asname.id.as_str()
+                    } else {
+                        alias.name.id.split('.').next().unwrap()
+                    };
+
+                    #[allow(unsafe_code)]
+                    let alias_id = unsafe {
+                        // SAFETY: The builder only visits nodes that are part of `module`. This guarantees that
+                        // the current statement must be a child of `module`.
+                        self.current_ast_ids().record_alias(alias, module)
+                    };
+
+                    let def = Definition::ImportAlias(alias_id);
+                    self.add_or_update_symbol_with_definition(Name::new(symbol_name), def);
+                    self.scopes_by_definition.insert(alias.into(), scope_id);
+                }
+            }
+            ast::Stmt::ImportFrom(ast::StmtImportFrom {
+                module: _,
+                names,
+                level: _,
+                ..
+            }) => {
+                let scope_id = self.current_scope();
+
+                for alias in names {
+                    let symbol_name = if let Some(asname) = &alias.asname {
+                        asname.id.as_str()
+                    } else {
+                        alias.name.id.as_str()
+                    };
+
+                    #[allow(unsafe_code)]
+                    let alias_id = unsafe {
+                        // SAFETY: The builder only visits nodes that are part of `module`. This guarantees that
+                        // the current statement must be a child of `module`.
+                        self.current_ast_ids().record_alias(alias, module)
+                    };
+
+                    let def = Definition::ImportAlias(alias_id);
+                    self.add_or_update_symbol_with_definition(Name::new(symbol_name), def);
+                    self.scopes_by_definition.insert(alias.into(), scope_id);
+                }
+            }
+            ast::Stmt::Assign(node) => {
+                debug_assert!(self.current_definition.is_none());
+                let scope_id = self.current_scope();
+
+                self.visit_expr(&node.value);
+                for target in &node.targets {
+                    #[allow(unsafe_code)]
+                    let expression_id = unsafe {
+                        // SAFETY: The builder only visits nodes that are part of `module`. This guarantees that
+                        // the current expression must be a child of `module`.
+                        self.current_ast_ids().record_expression(target, module)
+                    };
+
+                    self.current_definition = Some(Definition::Target(expression_id));
+                    self.visit_expression_with_id(target, expression_id);
+                    self.current_definition = None;
+                }
+            }
+            _ => {
+                walk_stmt(self, stmt);
+            }
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'_ ast::Expr) {
+        let module = self.module;
+        #[allow(unsafe_code)]
+        let expression_id = unsafe {
+            // SAFETY: The builder only visits nodes that are part of `module`. This guarantees that
+            // the current expression must be a child of `module`.
+            self.current_ast_ids().record_expression(expr, module)
+        };
+
+        self.visit_expression_with_id(expr, expression_id);
+    }
+}
+
 enum WithTypeParams<'a> {
     ClassDef {
         node: &'a ast::StmtClassDef,
@@ -471,15 +506,23 @@ impl<'a> WithTypeParams<'a> {
 
 struct NodeWithScope {
     id: NodeWithScopeId,
-    key: NodeWithScopeKey,
+    definition_key: Option<DefinitionNodeKey>,
     name: Name,
 }
 
 impl NodeWithScope {
-    fn new(node: impl Into<NodeWithScopeKey>, id: NodeWithScopeId, name: Name) -> Self {
+    fn new(id: NodeWithScopeId, name: Name) -> Self {
         Self {
             id,
-            key: node.into(),
+            definition_key: None,
+            name,
+        }
+    }
+
+    fn with_definition(id: NodeWithScopeId, name: Name, key: impl Into<DefinitionNodeKey>) -> Self {
+        Self {
+            id,
+            definition_key: Some(key.into()),
             name,
         }
     }
@@ -488,8 +531,8 @@ impl NodeWithScope {
         self.id
     }
 
-    fn key(&self) -> NodeWithScopeKey {
-        self.key
+    fn definition_key(&self) -> Option<DefinitionNodeKey> {
+        self.definition_key
     }
 
     fn scope_kind(&self) -> ScopeKind {
