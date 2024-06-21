@@ -5,10 +5,8 @@ mod tests {
     use std::io::{self, Read};
     use std::path::Path;
 
-    use path_slash::PathExt;
-
     use ruff_db::vendored::VendoredFileSystem;
-    use ruff_db::vfs::VendoredPath;
+    use ruff_db::vfs::VendoredPathBuf;
 
     // The file path here is hardcoded in this crate's `build.rs` script.
     // Luckily this crate will fail to build if this file isn't available at build time.
@@ -52,19 +50,15 @@ mod tests {
                     panic!("Expected {absolute_path:?} to be a child of {vendored_typeshed_dir:?}")
                 });
 
-            let posix_style_path = relative_path
-                .to_slash()
-                .unwrap_or_else(|| panic!("Expected {relative_path:?} to be a valid UTF-8 path"));
-
-            let vendored_path = VendoredPath::new(&*posix_style_path);
+            let vendored_path = VendoredPathBuf::try_from(relative_path).unwrap();
 
             assert!(
-                vendored_typeshed_stubs.exists(vendored_path),
+                vendored_typeshed_stubs.exists(&vendored_path),
                 "Expected {vendored_path:?} to exist in the `VendoredFileSystem`!"
             );
 
             let vendored_path_kind = vendored_typeshed_stubs
-                .metadata(vendored_path)
+                .metadata(&vendored_path)
                 .unwrap_or_else(|| {
                     panic!("Expected metadata for {vendored_path:?} to be retrievable from the `VendoredFileSystem!")
                 })
